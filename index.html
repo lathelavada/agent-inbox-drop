@@ -31,6 +31,11 @@
   <p class="hint">Drop files, zips, or whole folders. Max <strong>2&nbsp;GB per file</strong> (server-enforced).</p>
   <p class="hint">Write-only inbox: nothing is listed or readable from this page.</p>
 
+  <label for="note" class="hint" style="display:block;margin-top:12px">Note (optional) — what these files are / what to do with them:</label>
+  <textarea id="note" rows="2" maxlength="8192"
+            placeholder="e.g. 205 Dunlop invoices — file under draw 3"
+            style="width:100%;box-sizing:border-box;background:#0c1017;color:#dbe2ea;border:1px solid #33445a;border-radius:8px;padding:8px;font:inherit;font-size:.9rem;resize:vertical;margin:4px 0 6px"></textarea>
+
   <div id="dropzone" tabindex="0">drag &amp; drop files or folders here — or use the buttons below</div>
   <p>
     <label class="btn">Choose files<input type="file" id="fileInput" multiple hidden></label>
@@ -40,6 +45,21 @@
   <p id="bigHint">Large uploads may take a while. If the tab closes or the network drops mid-upload,
      re-drop the same file(s) and the upload resumes where it left off.</p>
   <ul id="fileList"></ul>
+
+  <hr style="border:none;border-top:1px solid #1c2634;margin:24px 0 14px">
+  <h2 style="font-size:1.05rem;margin:0 0 2px">History</h2>
+  <p class="hint">Files &amp; notes you've dropped — newest date first, collapsible. Passphrase required.</p>
+  <div id="histAuth">
+    <input id="histPass" type="password" placeholder="passphrase" autocomplete="off"
+           style="background:#0c1017;color:#dbe2ea;border:1px solid #33445a;border-radius:8px;padding:8px;font:inherit;font-size:.9rem;width:220px;max-width:60%">
+    <button class="btn" id="histUnlock">Unlock</button>
+    <span id="histAuthStatus" class="hint"></span>
+  </div>
+  <div id="histTools" style="display:none;margin:8px 0">
+    <button class="btn" id="histRefresh">Refresh</button>
+    <span id="histStatus" class="hint"></span>
+  </div>
+  <div id="historyTree"></div>
 
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/tus-js-client@4/dist/tus.min.js"></script>
@@ -63,6 +83,7 @@
   const dropzone = document.getElementById("dropzone");
   const fileInput = document.getElementById("fileInput");
   const folderInput = document.getElementById("folderInput");
+  const noteEl = document.getElementById("note");
 
   // All dynamic text goes through textContent — never innerHTML — so a
   // crafted filename cannot self-XSS this page.
@@ -192,6 +213,25 @@
     if (entries.some(e => e.file.size > BIG_HINT_BYTES)) bigHintEl.style.display = "block";
     setStatus("Uploading " + entries.length + " file(s) → " + batch + "/ …");
 
+    // Optional per-drop note → a small sidecar object in the SAME batch folder,
+    // so the fetch side can surface "what these files are" alongside them. The
+    // note text is never rendered on this page (write-only), so no XSS here; the
+    // fetch side treats its CONTENT as untrusted (terminal-injection guard).
+    const noteText = (noteEl && noteEl.value ? noteEl.value : "").trim().slice(0, 8192);
+    if (noteText) {
+      const noteStat = makeRow("_note.txt  (note)");
+      try {
+        await sb.storage.from(BUCKET).upload(
+          batch + "/_note.txt",
+          new Blob([noteText], { type: "text/plain; charset=utf-8" }),
+          { upsert: false, contentType: "text/plain; charset=utf-8", cacheControl: "3600" });
+        noteStat.textContent = "✓ note saved";
+      } catch (e) {
+        // best-effort — a failed note never blocks the file uploads
+        noteStat.textContent = "✗ note failed — " + String((e && e.message) || e);
+      }
+    }
+
     let ok = 0, failed = 0, skipped = 0;
     const tasks = entries.map(({ file, relPath }) => async () => {
       const clean = sanitizeRelPath(relPath || file.name);
@@ -281,6 +321,160 @@
   });
   window.addEventListener("dragover", e => e.preventDefault());
   window.addEventListener("drop", e => e.preventDefault());
+
+  // ---- history (passphrase-gated; server-mediated so the page never holds the powerful key) ----
+  const histPass = document.getElementById("histPass");
+  const histAuth = document.getElementById("histAuth");
+  const histAuthStatus = document.getElementById("histAuthStatus");
+  const histTools = document.getElementById("histTools");
+  const histStatus = document.getElementById("histStatus");
+  const treeEl = document.getElementById("historyTree");
+
+  const histApi = (path, opts) =>
+    fetch(path, Object.assign({ credentials: "same-origin" }, opts || {}));
+
+  // Defense-in-depth for DISPLAY: strip escape/control chars (kept safe by textContent too).
+  const cleanNote = (s) =>
+    String(s == null ? "" : s).replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "").slice(0, 4000);
+
+  function relock(msg) {
+    histTools.style.display = "none";
+    histAuth.style.display = "block";
+    histAuthStatus.textContent = msg || "locked";
+    treeEl.textContent = "";
+  }
+
+  async function doUnlock() {
+    histAuthStatus.textContent = "…";
+    let r;
+    try {
+      r = await histApi("/drop/api/unlock", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ passphrase: histPass.value }),
+      });
+    } catch { histAuthStatus.textContent = "network error"; return; }
+    if (r.status === 503) { histAuthStatus.textContent = "history not enabled yet"; return; }
+    if (!r.ok) { histAuthStatus.textContent = "wrong passphrase"; return; }
+    histPass.value = "";
+    histAuthStatus.textContent = "";
+    histAuth.style.display = "none";
+    histTools.style.display = "block";
+    loadTree();
+  }
+  document.getElementById("histUnlock").addEventListener("click", doUnlock);
+  histPass.addEventListener("keydown", e => { if (e.key === "Enter") doUnlock(); });
+  document.getElementById("histRefresh").addEventListener("click", loadTree);
+
+  async function fetchLevel(prefix) {
+    const r = await histApi("/drop/api/list?prefix=" + encodeURIComponent(prefix));
+    if (r.status === 401) { relock("session expired — unlock again"); throw new Error("locked"); }
+    if (!r.ok) throw new Error("list failed (" + r.status + ")");
+    const j = await r.json();
+    return { entries: j.entries || [], truncated: !!j.truncated };
+  }
+
+  async function loadTree() {
+    histStatus.textContent = "loading…";
+    treeEl.textContent = "";
+    try {
+      const dates = (await fetchLevel("")).entries.filter(e => e.folder)
+        .sort((a, b) => b.name.localeCompare(a.name));   // newest date first
+      if (!dates.length) { histStatus.textContent = "empty"; return; }
+      for (const d of dates) treeEl.appendChild(makeNode(d.name, d.name + "/", "date"));
+      histStatus.textContent = dates.length + " date(s)";
+    } catch (e) { if (e.message !== "locked") histStatus.textContent = "error: " + e.message; }
+  }
+
+  function fileRow(e) {
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex;justify-content:space-between;gap:12px;padding:2px 4px;border-bottom:1px solid #1c2634;font-size:.82rem";
+    const n = document.createElement("span"); n.className = "fname";
+    n.textContent = e.name; n.setAttribute("title", e.name);
+    const meta = document.createElement("span"); meta.className = "fstat";
+    meta.textContent = (e.size != null ? fmtBytes(e.size) : "") +
+                       (e.created_at ? "  " + new Date(e.created_at).toLocaleString() : "");
+    row.append(n, meta);
+    return row;
+  }
+
+  function doDelete(prefix, detEl, btn) {
+    btn.textContent = "deleting…";
+    histApi("/drop/api/delete", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ prefix }),
+    }).then(async r => {
+      if (r.status === 401) { relock("session expired — unlock again"); return; }
+      const j = await r.json().catch(() => ({}));
+      if (r.ok && j.stuck) { btn.textContent = "too nested — use CC tool"; btn.style.color = "#d9b45b"; }
+      else if (r.ok && !j.partial) { detEl.remove(); }
+      else if (r.ok && j.partial) { btn.textContent = "Delete more"; btn.style.color = ""; }
+      else { btn.textContent = "failed"; }
+    }).catch(() => { btn.textContent = "error"; });
+  }
+  function onDeleteClick(prefix, detEl, btn) {
+    if (btn.dataset.armed === "1") { btn.dataset.armed = ""; doDelete(prefix, detEl, btn); return; }
+    btn.dataset.armed = "1"; btn.textContent = "Confirm?"; btn.style.color = "#ff8f8f";
+    setTimeout(() => { if (btn.dataset.armed === "1") { btn.dataset.armed = ""; btn.textContent = "Delete"; btn.style.color = ""; } }, 4000);
+  }
+
+  // makeNode: a lazy collapsible <details> for a folder (date / drop / subfolder).
+  function makeNode(label, prefix, kind) {
+    const det = document.createElement("details");
+    det.style.margin = "2px 0 2px 8px";
+    const sum = document.createElement("summary");
+    sum.style.cursor = "pointer";
+    const lbl = document.createElement("span");
+    lbl.textContent = label + (kind === "batch" ? "  (drop)" : "");
+    sum.appendChild(lbl);
+    if (kind === "batch") {
+      const del = document.createElement("button");
+      del.className = "btn"; del.textContent = "Delete";
+      del.style.marginLeft = "10px"; del.style.fontSize = ".75rem"; del.style.padding = "2px 8px";
+      del.addEventListener("click", ev => { ev.preventDefault(); ev.stopPropagation(); onDeleteClick(prefix, det, del); });
+      sum.appendChild(del);
+    }
+    det.appendChild(sum);
+    const body = document.createElement("div");
+    body.style.margin = "2px 0 4px 14px";
+    det.appendChild(body);
+    let loaded = false;
+    det.addEventListener("toggle", async () => {
+      if (!det.open || loaded) return;
+      loaded = true;
+      body.textContent = "loading…";
+      try {
+        let noteText = null;
+        if (kind === "batch") {
+          const nr = await histApi("/drop/api/note?prefix=" + encodeURIComponent(prefix));
+          if (nr.status === 401) { relock("session expired — unlock again"); return; }
+          if (nr.ok) { noteText = (await nr.json().catch(() => ({}))).note || null; }
+        }
+        const lvl = await fetchLevel(prefix);
+        const entries = lvl.entries;
+        const childKind = kind === "date" ? "batch" : "content";   // date's children are drops
+        body.textContent = "";
+        if (noteText) {
+          const nb = document.createElement("div");
+          nb.style.cssText = "background:#16202e;border:1px solid #33445a;border-radius:6px;padding:6px 8px;margin:2px 0 6px;color:#cfe3ff;white-space:pre-wrap;font-size:.85rem";
+          nb.textContent = "📝 " + cleanNote(noteText);
+          body.appendChild(nb);
+        }
+        for (const e of entries) {
+          if (e.folder) body.appendChild(makeNode(e.name, prefix + e.name + "/", childKind));
+          else body.appendChild(fileRow(e));
+        }
+        if (lvl.truncated) {
+          const t = document.createElement("div"); t.className = "hint";
+          t.textContent = "(showing first " + entries.length + " — use the CC fetch tool for the rest)";
+          body.appendChild(t);
+        }
+        if (!entries.length && !noteText) {
+          const em = document.createElement("div"); em.className = "hint"; em.textContent = "(empty)"; body.appendChild(em);
+        }
+      } catch (e2) { if (e2.message !== "locked") body.textContent = "error: " + e2.message; }
+    });
+    return det;
+  }
   </script>
 </body>
 </html>
