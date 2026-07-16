@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Agent Inbox — file drop</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         background: #10141a; color: #dbe2ea; max-width: 760px; margin: 40px auto; padding: 0 16px; }
+  h1 { font-size: 1.4rem; margin-bottom: 4px; }
+  .hint { color: #8a97a8; font-size: .85rem; margin: 2px 0; }
+  #dropzone { border: 2px dashed #3a4a5e; border-radius: 12px; padding: 48px 16px; text-align: center;
+              color: #8a97a8; margin: 18px 0 10px; transition: border-color .15s, background .15s; cursor: pointer; }
+  #dropzone.hot { border-color: #4da3ff; background: #16202e; color: #cfe3ff; }
+  .btn { display: inline-block; background: #1d2836; border: 1px solid #33445a; border-radius: 8px;
+         padding: 8px 14px; margin-right: 8px; cursor: pointer; font-size: .9rem; }
+  .btn:hover { background: #243449; }
+  #status { margin: 14px 0 6px; font-size: .95rem; min-height: 1.2em; }
+  #bigHint { color: #d9b45b; font-size: .85rem; display: none; }
+  ul#fileList { list-style: none; padding: 0; margin: 8px 0; font-size: .85rem; }
+  ul#fileList li { display: flex; justify-content: space-between; gap: 12px; padding: 4px 8px;
+                   border-bottom: 1px solid #1c2634; }
+  .fname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #b9c4d1; }
+  .fstat { white-space: nowrap; color: #8a97a8; }
+</style>
+</head>
+<body>
+  <h1>Agent Inbox</h1>
+  <p class="hint">Drop files, zips, or whole folders. Max <strong>2&nbsp;GB per file</strong> (server-enforced).</p>
+  <p class="hint">Write-only inbox: nothing is listed or readable from this page.</p>
+
+  <div id="dropzone" tabindex="0">drag &amp; drop files or folders here — or use the buttons below</div>
+  <p>
+    <label class="btn">Choose files<input type="file" id="fileInput" multiple hidden></label>
+    <label class="btn">Choose folder<input type="file" id="folderInput" webkitdirectory hidden></label>
+  </p>
+  <div id="status" role="status" aria-live="polite"></div>
+  <p id="bigHint">Large uploads may take a while. If the tab closes or the network drops mid-upload,
+     re-drop the same file(s) and the upload resumes where it left off.</p>
+  <ul id="fileList"></ul>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/tus-js-client@4/dist/tus.min.js"></script>
+  <script>
+  "use strict";
+  // Injected by setup-agent-inbox.py. The anon key is already public
+  // (it ships in every r3nzo client) — this exposes nothing new.
+  const SUPABASE_URL = "https://xodykeoxkojvduuhlugv.supabase.co";
+  const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InhvZHlrZW94a29qdmR1dWhsdWd2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQ3MzE0NTAsImV4cCI6MjA5MDMwNzQ1MH0.0vuwQcVlFP7-pE28s2FdspuRoD3jodwSIG1-xGts1MA";
+
+  const BUCKET = "agent-inbox";
+  const TUS_THRESHOLD = 6 * 1024 * 1024;      // >6 MB goes resumable/TUS
+  const TUS_CHUNK = 6 * 1024 * 1024;          // Supabase requires exactly 6 MB chunks
+  const MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024;  // mirrors the server-enforced bucket cap
+  const BIG_HINT_BYTES = 300 * 1024 * 1024;
+  const CONCURRENCY = 3;
+
+  const statusEl = document.getElementById("status");
+  const bigHintEl = document.getElementById("bigHint");
+  const fileListEl = document.getElementById("fileList");
+  const dropzone = document.getElementById("dropzone");
+  const fileInput = document.getElementById("fileInput");
+  const folderInput = document.getElementById("folderInput");
+
+  // All dynamic text goes through textContent — never innerHTML — so a
+  // crafted filename cannot self-XSS this page.
+  function setStatus(msg) { statusEl.textContent = msg; }
+
+  let sb = null;
+  if (!/^https:\/\//.test(SUPABASE_URL) || SUPABASE_ANON_KEY.length < 20) {
+    setStatus("Not configured — run setup-agent-inbox.py to inject the project URL and anon key.");
+  } else {
+    sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY,
+                                      { auth: { persistSession: false } });
+  }
+
+  // ---- path building -----------------------------------------------------
+  function sanitizeSegment(seg) {
+    let s = "";
+    for (const ch of seg) {
+      const c = ch.codePointAt(0);
+      if (c < 32 || c === 127) continue;                 // strip null/control
+      s += /[A-Za-z0-9._-]/.test(ch) ? ch : "_";         // allowlist -> _
+    }
+    if (s.length > 200) s = s.slice(0, 200);             // per-segment cap
+    if (s === "" || s === "." || s === "..") s = "_";    // no traversal tokens
+    return s;
+  }
+  function sanitizeRelPath(rel) {
+    const parts = String(rel).split("/").filter(p => p !== "").map(sanitizeSegment);
+    return parts.length ? parts.join("/") : "_";
+  }
+  function random8() {
+    const bytes = new Uint8Array(8);
+    crypto.getRandomValues(bytes);
+    const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+    let out = "";
+    for (const b of bytes) out += alphabet[b % 36];
+    return out;
+  }
+  function todayStamp() {
+    const d = new Date();
+    const p = n => String(n).padStart(2, "0");
+    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate());
+  }
+  function fmtBytes(n) {
+    if (n >= 1024 ** 3) return (n / 1024 ** 3).toFixed(2) + " GB";
+    if (n >= 1024 ** 2) return (n / 1024 ** 2).toFixed(1) + " MB";
+    if (n >= 1024) return (n / 1024).toFixed(0) + " KB";
+    return n + " B";
+  }
+
+  // ---- UI rows -----------------------------------------------------------
+  function makeRow(label) {
+    const li = document.createElement("li");
+    const name = document.createElement("span");
+    name.className = "fname";
+    name.textContent = label;
+    name.setAttribute("title", label);
+    const stat = document.createElement("span");
+    stat.className = "fstat";
+    stat.textContent = "queued";
+    li.append(name, stat);
+    fileListEl.appendChild(li);
+    return stat;
+  }
+
+  // ---- uploads -----------------------------------------------------------
+  async function uploadSmall(file, objectPath) {
+    const { error } = await sb.storage.from(BUCKET).upload(objectPath, file, {
+      upsert: false,                       // anon has INSERT only — never upsert
+      contentType: file.type || "application/octet-stream",
+      cacheControl: "3600",
+    });
+    if (error) throw error;
+  }
+
+  function uploadLarge(file, objectPath, relPath, stat) {
+    return new Promise((resolve, reject) => {
+      const upload = new tus.Upload(file, {
+        endpoint: SUPABASE_URL + "/storage/v1/upload/resumable",
+        retryDelays: [0, 3000, 5000, 10000, 20000, 60000],
+        headers: {
+          authorization: "Bearer " + SUPABASE_ANON_KEY,
+          apikey: SUPABASE_ANON_KEY,
+          "x-upsert": "false",
+        },
+        uploadDataDuringCreation: true,
+        removeFingerprintOnSuccess: true,   // clear localStorage entry on success
+        chunkSize: TUS_CHUNK,
+        metadata: {
+          bucketName: BUCKET,
+          objectName: objectPath,
+          contentType: file.type || "application/octet-stream",
+          cacheControl: "3600",
+        },
+        // Keyed by name+size (NOT the per-batch random dir), so a reload can
+        // resume the same file even though a new batch id was generated. The
+        // resumed upload keeps its ORIGINAL object path from creation time.
+        fingerprint: async () =>
+          ["agent-inbox-drop", relPath, file.size, file.lastModified].join("::"),
+        onError: reject,
+        onProgress: (sent, total) => {
+          stat.textContent = "uploading " + Math.floor((sent / total) * 100) +
+                             "% of " + fmtBytes(total);
+        },
+        onSuccess: resolve,
+      });
+      upload.findPreviousUploads().then(prev => {
+        if (prev.length) {
+          upload.resumeFromPreviousUpload(prev[0]);
+          stat.textContent = "resuming previous upload (keeps its original path)…";
+        }
+        upload.start();
+      }).catch(() => upload.start());
+    });
+  }
+
+  async function pool(tasks, n) {
+    const q = tasks.slice();
+    const workers = Array.from({ length: Math.min(n, q.length) },
+      async () => { while (q.length) await q.shift()(); });
+    await Promise.all(workers);
+  }
+
+  async function handleFiles(entries) {   // entries: [{file, relPath}]
+    if (!sb) { setStatus("Not configured — cannot upload."); return; }
+    if (!entries.length) return;
+    const batch = todayStamp() + "/" + random8();   // random8 scoped to the DROP, not per file
+    if (entries.some(e => e.file.size > BIG_HINT_BYTES)) bigHintEl.style.display = "block";
+    setStatus("Uploading " + entries.length + " file(s) → " + batch + "/ …");
+
+    let ok = 0, failed = 0, skipped = 0;
+    const tasks = entries.map(({ file, relPath }) => async () => {
+      const clean = sanitizeRelPath(relPath || file.name);
+      const objectPath = batch + "/" + clean;
+      const stat = makeRow(clean + "  (" + fmtBytes(file.size) + ")");
+      if (file.size > MAX_FILE_BYTES) {
+        stat.textContent = "skipped — exceeds the 2 GB per-file server cap";
+        skipped++;
+        return;
+      }
+      try {
+        if (file.size > TUS_THRESHOLD) {
+          await uploadLarge(file, objectPath, clean, stat);
+        } else {
+          stat.textContent = "uploading…";
+          await uploadSmall(file, objectPath);
+        }
+        stat.textContent = "✓ uploaded";
+        ok++;
+      } catch (e) {
+        failed++;
+        const msg = String((e && e.message) || e);
+        stat.textContent = /already exists|409|duplicate/i.test(msg)
+          ? "✗ already exists (overwrite is disabled)"
+          : "✗ failed — " + msg;
+      }
+    });
+    await pool(tasks, CONCURRENCY);
+    setStatus("Done: " + ok + " uploaded, " + failed + " failed, " + skipped +
+              " skipped — batch " + batch + "/");
+  }
+
+  // ---- gathering files (inputs + drag-drop, incl. dropped folders) --------
+  function filesFromInput(input) {
+    return Array.from(input.files || []).map(f => ({
+      file: f,
+      relPath: f.webkitRelativePath || f.name,   // preserves folder structure
+    }));
+  }
+
+  function walkEntry(entry, prefix, out) {
+    return new Promise(resolve => {
+      if (entry.isFile) {
+        entry.file(f => { out.push({ file: f, relPath: prefix + entry.name }); resolve(); },
+                   () => resolve());
+      } else if (entry.isDirectory) {
+        const reader = entry.createReader();
+        const readBatch = () => reader.readEntries(async ents => {
+          if (!ents.length) return resolve();
+          for (const e of ents) await walkEntry(e, prefix + entry.name + "/", out);
+          readBatch();          // readEntries returns <=100 per call — keep reading
+        }, () => resolve());
+        readBatch();
+      } else resolve();
+    });
+  }
+
+  async function filesFromDataTransfer(dt) {
+    const out = [];
+    const entries = Array.from(dt.items || [])
+      .map(i => i.webkitGetAsEntry && i.webkitGetAsEntry())
+      .filter(Boolean);
+    if (entries.length) {
+      for (const e of entries) await walkEntry(e, "", out);
+    } else {
+      for (const f of Array.from(dt.files || [])) out.push({ file: f, relPath: f.name });
+    }
+    return out;
+  }
+
+  // ---- wiring --------------------------------------------------------------
+  fileInput.addEventListener("change", () => {
+    handleFiles(filesFromInput(fileInput));
+    fileInput.value = "";
+  });
+  folderInput.addEventListener("change", () => {
+    handleFiles(filesFromInput(folderInput));
+    folderInput.value = "";
+  });
+  dropzone.addEventListener("click", () => fileInput.click());
+  ["dragenter", "dragover"].forEach(ev =>
+    dropzone.addEventListener(ev, e => { e.preventDefault(); dropzone.classList.add("hot"); }));
+  ["dragleave", "drop"].forEach(ev =>
+    dropzone.addEventListener(ev, e => { e.preventDefault(); dropzone.classList.remove("hot"); }));
+  dropzone.addEventListener("drop", async e => {
+    handleFiles(await filesFromDataTransfer(e.dataTransfer));
+  });
+  window.addEventListener("dragover", e => e.preventDefault());
+  window.addEventListener("drop", e => e.preventDefault());
+  </script>
+</body>
+</html>
